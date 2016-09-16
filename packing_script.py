@@ -1,21 +1,18 @@
+import collections
 import glob
 import os
 import datetime
 
 def getMeta(path):
-    filename = os.path.basename(path).replace('.nc', '')
-    dataset, date_str, tile, resolution, create_date = filename.split('.')
+    filename = os.path.basename(path)
+    dataset, date_str, tile, resolution, name = filename.split('.', maxsplit=4)
     return {'date': datetime.datetime.strptime(date_str, 'A%Y%j'), 'tile': tile}
 
 def getModisFileDict(files):
-    org_files = {}
+    org_files = collections.defaultdict(list)
     for afile in files:
         meta = getMeta(afile)
-        tile, year = meta['tile'], meta['date'].year
-        if tile not in org_files:
-            org_files[tile] = {}
-        org_files[tile][year] = org_files[tile].get(year, []) + [afile]
-        
+        org_files[(meta['tile'], meta['date'].year)] += [afile]
     return org_files
 
 

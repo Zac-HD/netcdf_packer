@@ -1,24 +1,30 @@
-import glob
+
 import argparse
+import datetime
+import functools
+import glob
+import json
+
 import netCDF4
 import numpy as np
-import datetime
-import sys
-import os
-import json
 
 
 def pack(id, name, lr):
-    # Config
-    # 1. Where are the source files?
-    config = {True: {"source_path": "/short/z00/prl900/nonagg_tiles/{}/FC_LR.*.nc", "scale": 10}, False: {"source_path": "/short/z00/prl900/nonagg_tiles/{}/FC.*.nc", "scale": 1}}
-    
+    # Config - Where are the source files?  What resolution to use?
+    config = {
+        True: {  # lr=True, use lowres tiles
+            "source_path": "/short/z00/prl900/nonagg_tiles/{}/FC_LR.*.nc",
+            "scale": 10},
+        False: {  # lr=False, use full resolution tiles
+            "source_path": "/short/z00/prl900/nonagg_tiles/{}/FC.*.nc",
+            "scale": 1}
+        }
+
     phot_stack = None
     nphot_stack = None
     bare_stack = None
 
     timestamps = []
-    semaphore = True
     proj_wkt = None
     geot = None
 
@@ -28,11 +34,10 @@ def pack(id, name, lr):
         timestamps.append(date)
    
         with netCDF4.Dataset(file, 'r', format='NETCDF4') as src:
-            if semaphore:
+            if geot is None:
                 var = src["sinusoidal"]
                 proj_wkt = var.spatial_ref
-                geot = [float(val) for val in var.GeoTransform.split(" ") if val != ""]
-                semaphore = False
+                geot = [float(val) for val in var.GeoTransform.split(" ") if val]
 
             if phot_stack is None:
                 phot_stack = np.expand_dims(src["phot_veg"][:], axis=0)
@@ -49,7 +54,7 @@ def pack(id, name, lr):
             for key in attrs:
                 setattr(dest, key, attrs[key])
  
-        setattr(dest, "date_created", datetime.datetime.now().strftime("%Y%m%dT%H%M%S"))
+        setattr(dest, "date_created", datetime.datetime.utcnow().isoformat())
 
         t_dim = dest.createDimension("time", len(timestamps))
         x_dim = dest.createDimension("x", phot_stack.shape[2])
@@ -66,7 +71,10 @@ def pack(id, name, lr):
         var.units = "m"
         var.long_name = "x coordinate of projection"
         var.standard_name = "projection_x_coordinate"
-        var[:] = np.linspace(geot[0], geot[0]+(config[lr]["scale"]*geot[1]*phot_stack.shape[2]), phot_stack.shape[2])
+        var[:] = np.linspace(
+            geot[0],
+            geot[0] + (config[lr]["scale"] * geot[1] * phot_stack.shape[2]),
+            phot_stack.shape[2])
 
         var = dest.createVariable("y", "f8", ("y",))
         var.units = "m"
@@ -74,29 +82,31 @@ def pack(id, name, lr):
         var.standard_name = "projection_y_coordinate"
         var[:] = np.linspace(geot[3], geot[3]+(config[lr]["scale"]*geot[5]*phot_stack.shape[1]), phot_stack.shape[1])
 
-        var = dest.createVariable("phot_veg", "i1", dimensions=("time", "y", "x"), fill_value=255, zlib=True, chunksizes=(1, 240, 240))
-        #var = dest.createVariable("phot_veg", "i1", dimensions=("time", "y", "x"), fill_value=255, zlib=True, chunksizes=(5, 240, 240))
+        # Same variable properties for all data.
+        # NB: use chunksizes = (5, 240, 240) for low-res data.
+        create_data_var = functools.partial(
+            dest.createVariable, datatype='i1', dimensions=("time", "y", "x"),
+            fill_value=255, zlib=True, chunksizes=(1, 240, 240))
+
+        var = create_data_var("phot_veg")
         var.long_name = "Photosynthetic Vegetation"
         var.units = '%'
         var.grid_mapping = "sinusoidal"
         var[:] = phot_stack
 
-        var = dest.createVariable("nphot_veg", "i1", dimensions=("time", "y", "x"), fill_value=255, zlib=True, chunksizes=(1, 240, 240))
-        #var = dest.createVariable("nphot_veg", "i1", dimensions=("time", "y", "x"), fill_value=255, zlib=True, chunksizes=(5, 240, 240))
+        var = create_data_var("nphot_veg")
         var.long_name = "Non Photosynthetic Vegetation"
         var.units = '%'
         var.grid_mapping = "sinusoidal"
         var[:] = nphot_stack
 
-        var = dest.createVariable("bare_soil", "i1", dimensions=("time", "y", "x"), fill_value=255, zlib=True, chunksizes=(1, 240, 240))
-        #var = dest.createVariable("bare_soil", "i1", dimensions=("time", "y", "x"), fill_value=255, zlib=True, chunksizes=(5, 240, 240))
+        var = create_data_var("bare_soil")
         var.long_name = "Bare Soil"
         var.units = '%'
         var.grid_mapping = "sinusoidal"
         var[:] = bare_stack
 
         var = dest.createVariable("sinusoidal", 'S1', ())
-
         var.grid_mapping_name = "sinusoidal"
         var.false_easting = 0.0
         var.false_northing = 0.0
@@ -107,17 +117,6 @@ def pack(id, name, lr):
         var.spatial_ref = proj_wkt
         var.GeoTransform = "{} {} {} {} {} {}".format(geot[0], 10*geot[1], geot[2], geot[3], geot[4], 10*geot[5])
 
-"""
-entries = glob.glob("./*")
-for entrie in entries:
-    #print(entrie)
-    if os.path.isdir(entrie):
-        if len(glob.glob(entrie + "/FC_LR.v302.MCD43A4*.nc*")) > 0:
-            if not os.path.isfile("FC_LR.v302.MCD43A4/FC_LR.v302.MCD43A4.{}.005.nc".format(entrie[2:])):
-                print("python packer.py {}".format(entrie))
-                #pack(entrie[2:], "FC_LR.v302.MCD43A4/FC_LR.v302.MCD43A4.{}.005.nc".format(entrie[2:]))
-    #break
-"""
 
 if __name__ == "__main__":
 
