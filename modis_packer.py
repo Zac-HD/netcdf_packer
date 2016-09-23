@@ -23,7 +23,7 @@ AffineGeoTransform = collections.namedtuple(
     'GeoTransform', ['origin_x', 'pixel_width', 'x_2',
                      'origin_y', 'pixel_height', 'y_5'])
 # An XY coordinate in pixels
-RasterShape = collections.namedtuple('Shape', ['x', 'y'])
+RasterShape = collections.namedtuple('Shape', ['time', 'y', 'x'])
 
 
 def fname_metadata(path, date_fmt=None):
@@ -39,46 +39,41 @@ def fname_metadata(path, date_fmt=None):
     return metadata(**split)
 
 
-def stack_tiles(fname_list, *, args):
-    """Stack the list of input tiles, according to the given arguments."""
-    out_fname = os.path.join(
-        args.output_dir, '{0}.{1.year}.{2}.{3}.{4}'.format(
-            *fname_metadata(os.path.basename(fname_list[0]),
-                            args.strptime_fmt)))
-    geot = None
-    proj_wkt = None
-    raster_size = None
-    metadata = collections.defaultdict(dict)
-    data = collections.OrderedDict()
-
-    for file in sorted(fname_list):
-        ts = fname_metadata(file, args.strptime_fmt).date.timestamp()
-        with netCDF4.Dataset(file, format='NETCDF4') as src:
-            assert 'time' not in src.dimensions
+def get_tile_data(fname, metadata, data_ts, sinusoidal):
+    """Add file data to the metadata and data dictionaries."""
+    # Yep, a function which only returns by mutating it's arguments...
+    assert fname.endswith('.nc')
+    with netCDF4.Dataset(fname, format='NETCDF4') as src:
+        assert 'time' not in src.dimensions
+        # Save metadata every time (low-cost, easier reading)
+        for name, attr in src.variables.items():
+            # Skip all but the data-carrying variables
+            if name in src.dimensions:
+            #('x', 'y', ):
+                continue
+            if name == 'sinusoidal':
+                for k in ('grid_mapping_name', 'false_easting',
+                          'false_northing', 'longitude_of_central_meridian',
+                          'longitude_of_prime_meridian', 'semi_major_axis',
+                          'inverse_flattening', 'spatial_ref', 'GeoTransform'):
+                    sinusoidal[k] = getattr(attr, k)
+                continue
             # Save metadata every time (low-cost, easier reading)
-            proj_wkt = src["sinusoidal"].spatial_ref
-            geot = AffineGeoTransform(
-                *(float(v) for v in src["sinusoidal"].GeoTransform.split()))
-            for name, attr in src.variables.items():
-                # Skip all but the data-carrying variables
-                if name in ('x', 'y', 'sinusoidal'):
-                    continue
-                # Save metadata every time (low-cost, easier reading)
-                raster_size = RasterShape(*attr.shape)
-                for k in ('long_name', 'units', 'grid_mapping', 'dtype'):
-                    metadata[name][k] = getattr(attr, k)
-                # No ordered defaultdict class, and order is more important
-                data[ts] = data.get(ts) or {}
-                data[ts][name] = np.copy(attr)
+            for k in ('long_name', 'units', 'grid_mapping', 'dtype'):
+                metadata[name][k] = getattr(attr, k)
+            # No ordered defaultdict class, and order is more important
+            data_ts[name] = np.copy(attr)
 
-    # check time-slices are ordered and save them
-    assert list(data) == sorted(data)
-    timestamps = tuple(data)
-    # Replace "data" with a dict of variables to stacked rasters (ie cubes)
-    data = {name: np.stack([data[ts][name] for ts in timestamps], axis=0)
-            for name in metadata}
 
-    with netCDF4.Dataset(out_fname, 'w', format='NETCDF4_CLASSIC') as dest:
+def write_stacked_netcdf(
+        *, filename, args, timestamps, data, metadata, sinusoidal):
+    """Write a big file."""
+    # Calculate some helpers
+    raster_size = RasterShape(*data[next(iter(metadata))].shape)
+    geot = AffineGeoTransform(
+        *[float(v) for v in sinusoidal['GeoTransform'].split()])
+    # Write the file
+    with netCDF4.Dataset(filename, 'w', format='NETCDF4_CLASSIC') as dest:
         # Set top-level file attributes and metadata
         for key, val in args.metadata.items():
             setattr(dest, key, val)
@@ -86,48 +81,40 @@ def stack_tiles(fname_list, *, args):
 
         # Create dimensions and corresponding variables
         dest.createDimension("time", len(timestamps))
-        tvar = dest.createVariable("time", "f8", ("time",))
-        tvar.units = "seconds since 1970-01-01 00:00:00.0"
-        tvar.calendar = "standard"
-        tvar.long_name = "Time, unix time-stamp"
-        tvar.standard_name = "time"
-        tvar[:] = timestamps
+        dest.createVariable("time", "f8", ("time",))
+        dest['time'].units = "seconds since 1970-01-01 00:00:00.0"
+        dest['time'].calendar = "standard"
+        dest['time'].long_name = "Time, unix time-stamp"
+        dest['time'].standard_name = "time"
+        dest['time'][:] = timestamps
 
         dest.createDimension("x", raster_size.x)
-        xvar = dest.createVariable("x", "f8", ("x",))
-        xvar.units = "m"
-        xvar.long_name = "x coordinate of projection"
-        xvar.standard_name = "projection_x_coordinate"
-        xvar[:] = np.linspace(
+        dest.createVariable("x", "f8", ("x",))
+        dest['x'].units = "m"
+        dest['x'].long_name = "x coordinate of projection"
+        dest['x'].standard_name = "projection_x_coordinate"
+        dest['x'][:] = np.linspace(
             start=geot.origin_x,
             stop=geot.origin_x + geot.pixel_width * raster_size.x,
             num=raster_size.x)
 
         dest.createDimension("y", raster_size.y)
-        yvar = dest.createVariable("y", "f8", ("y",))
-        yvar.units = "m"
-        yvar.long_name = "y coordinate of projection"
-        yvar.standard_name = "projection_y_coordinate"
-        yvar[:] = np.linspace(
+        dest.createVariable("y", "f8", ("y",))
+        dest['y'].units = "m"
+        dest['y'].long_name = "y coordinate of projection"
+        dest['y'].standard_name = "projection_y_coordinate"
+        dest['y'][:] = np.linspace(
             start=geot.origin_y,
             stop=geot.origin_y + geot.pixel_height * raster_size.y,
             num=raster_size.y)
 
-        svar = dest.createVariable("sinusoidal", 'S1', ())
-        svar.grid_mapping_name = "sinusoidal"
-        svar.false_easting = 0.0
-        svar.false_northing = 0.0
-        svar.longitude_of_central_meridian = 0.0
-        svar.longitude_of_prime_meridian = 0.0
-        svar.semi_major_axis = 6371007.181
-        svar.inverse_flattening = 0.0
-        svar.spatial_ref = proj_wkt
-        # Note: scale pixel width and height if scale has been changed
-        svar.GeoTransform = "{} {} {} {} {} {}".format(*geot)
+        # The sinusoidal variable is somewhat special; attrs saved above
+        dest.createVariable("sinusoidal", 'S1', ())
+        for name, val in sinusoidal.items():
+            setattr(dest['sinusoidal'], name, val)
 
         def make_var(dest, name, attrs, cube):
             """Create a data variable, add data, and set attributes."""
-            args.compress_chunk = (1, 240, 240)
             var = dest.createVariable(
                 name, attrs.pop('dtype'), dimensions=("time", "y", "x"),
                 zlib=bool(args.compress_chunk), chunksizes=args.compress_chunk)
@@ -137,6 +124,33 @@ def stack_tiles(fname_list, *, args):
 
         for name, attrs in metadata.items():
             make_var(dest, name, attrs, data[name])
+
+
+def stack_tiles(fname_list, *, args):
+    """Stack the list of input tiles, according to the given arguments."""
+    sinusoidal = {}
+    metadata = collections.defaultdict(dict)
+    data = collections.OrderedDict()
+    for timestamp, file in sorted(
+            (fname_metadata(f, args.strptime_fmt).date.timestamp(), f)
+            for f in fname_list):
+        data[timestamp] = data.get(timestamp) or {}
+        get_tile_data(file, metadata, data[timestamp], sinusoidal)
+
+    # check that we did actually read something
+    assert metadata, 'Input files must have data variables'
+    assert sinusoidal, 'MODIS tiles must have a sinusoidal variable'
+
+    out_file = os.path.join(
+        args.output_dir, '{0}.{1.year}.{2}.{3}.{4}'.format(
+            *fname_metadata(os.path.basename(fname_list[0]),
+                            args.strptime_fmt)))
+    # Write out the aggregated thing
+    write_stacked_netcdf(
+        filename=out_file, args=args, timestamps=tuple(data),
+        data={name: np.stack([dat[name] for dat in data.values()], axis=0)
+              for name in metadata},
+        metadata=metadata, sinusoidal=sinusoidal)
 
 
 def main():
@@ -166,32 +180,31 @@ def get_validated_args():
     type validation functions, to 'fail fast' and simplify other code.
     This gives much better user feedback in the calling shell, too.
     """
-    ATE = argparse.ArgumentTypeError
-
     def glob_arg_type(val):
         """Validate arg and transform glob pattern to file list."""
         files = tuple(os.path.normpath(p) for p in glob.glob(val))
         if not files:
-            raise ATE('glob pattern matchs no files')
+            raise argparse.ArgumentTypeError('glob pattern matchs no files')
         return files
 
     def dir_arg_type(val):
         """Validate that arg is an existing directory."""
         if not os.path.exists(val):
-            raise ATE('path does not exist')
+            raise argparse.ArgumentTypeError('path does not exist')
         if not os.path.isdir(val):
-            raise ATE('path is not a directory')
+            raise argparse.ArgumentTypeError('path is not a directory')
         return val
 
     def nc_meta_type(fname):
         """Load attributes from json file with useful errors."""
         if not os.path.isfile(fname):
-            raise ATE(fname + ' does not exist')
+            raise argparse.ArgumentTypeError(fname + ' does not exist')
         try:
             with open(fname) as file_handle:
                 attrs = json.load(file_handle)
         except:
-            raise ATE('could not load attributes from ' + fname)
+            raise argparse.ArgumentTypeError(
+                'could not load attributes from ' + fname)
         # TODO:  check attributes match relevant conventions
         return attrs
 
@@ -200,13 +213,18 @@ def get_validated_args():
         if string == '0':
             return ()
         try:
-            size = tuple(int(n) for n in string.strip('()').split(','))
+            size = [int(n) for n in string.strip('()').split(',')]
         except Exception:
-            raise ATE('could not parse chunksize to integers')
-        if len(size) != 3:
-            raise ATE('chunksize must be three dimensional (time, X, Y)')
-        if not all(n <= 1 for n in size):
-            raise ATE('all dimensions of chunksize must be positive integers')
+            raise argparse.ArgumentTypeError(
+                'could not parse chunksize to integers')
+        try:
+            size = RasterShape(*size)
+        except TypeError:
+            raise argparse.ArgumentTypeError(
+                'chunksize must be three dimensional (time, Y, X)')
+        if not all(n >= 1 for n in size):
+            raise argparse.ArgumentTypeError(
+                'all dimensions of chunksize must be natural numbers')
         return size
 
     parser = argparse.ArgumentParser(description=__doc__)
@@ -229,8 +247,8 @@ def get_validated_args():
         help='Date format in filenames. default=%(default)s')
 
     parser.add_argument(
-        '--compress_chunk', default=(1, 240, 240), metavar='T,X,Y',
-        type=chunksize_type, help=(
+        '--compress_chunk', default=chunksize_type('1,240,240'),
+        metavar='T,Y,X', type=chunksize_type, help=(
             'Chunk size for compression as comma-seperated integers, '
             'default=%(default)s.  The default is tuned for 2D display; '
             'increase time-length of chunk if time-dimension access is '
