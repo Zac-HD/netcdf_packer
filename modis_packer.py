@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 """A tool to pack Modis tiles into NetCDF files, aggregated by tile and year.
+
+Planned features include reprojection (sinusoidal to WGS84) and combining
+datasets (ie variables) from multiple files.
+
 """
 
 import argparse
@@ -15,7 +19,7 @@ import netCDF4
 import numpy as np
 
 # Version of the generic Modis Tile Stacker
-__version__ = '0.0.1'
+__version__ = '0.0.2'
 
 # Names are descriptive assuming a north-up image, and raster coords start
 # at the top-left.  See http://www.gdal.org/gdal_datamodel.html
@@ -23,7 +27,7 @@ AffineGeoTransform = collections.namedtuple(
     'GeoTransform', ['origin_x', 'pixel_width', 'x_2',
                      'origin_y', 'pixel_height', 'y_5'])
 # An XY coordinate in pixels
-RasterShape = collections.namedtuple('Shape', ['time', 'y', 'x'])
+RasterShape = collections.namedtuple('RasterShape', ['time', 'y', 'x'])
 
 
 def fname_metadata(path, date_fmt=None):
@@ -39,17 +43,15 @@ def fname_metadata(path, date_fmt=None):
     return metadata(**split)
 
 
-def get_tile_data(fname, metadata, data_ts, sinusoidal):
-    """Add file data to the metadata and data dictionaries."""
-    # Yep, a function which only returns by mutating it's arguments...
+def get_tile_data(fname):
+    """Return file data and metadata as dictionaries."""
     assert fname.endswith('.nc')
+    data, sinusoidal, metadata = {}, {}, {}
     with netCDF4.Dataset(fname, format='NETCDF4') as src:
         assert 'time' not in src.dimensions
-        # Save metadata every time (low-cost, easier reading)
         for name, attr in src.variables.items():
             # Skip all but the data-carrying variables
             if name in src.dimensions:
-            #('x', 'y', ):
                 continue
             if name == 'sinusoidal':
                 for k in ('grid_mapping_name', 'false_easting',
@@ -58,15 +60,14 @@ def get_tile_data(fname, metadata, data_ts, sinusoidal):
                           'inverse_flattening', 'spatial_ref', 'GeoTransform'):
                     sinusoidal[k] = getattr(attr, k)
                 continue
-            # Save metadata every time (low-cost, easier reading)
-            for k in ('long_name', 'units', 'grid_mapping', 'dtype'):
-                metadata[name][k] = getattr(attr, k)
-            # No ordered defaultdict class, and order is more important
-            data_ts[name] = np.copy(attr)
+            metadata[name] = {k: getattr(attr, k) for k in
+                              ('long_name', 'units', 'grid_mapping', 'dtype')}
+            data[name] = np.copy(attr)
+    return data, metadata, sinusoidal
 
 
-def write_stacked_netcdf(
-        *, filename, args, timestamps, data, metadata, sinusoidal):
+def write_stacked_netcdf(*, filename, timestamps, data, metadata, sinusoidal,
+                         attributes, chunk_shape):
     """Write a big file."""
     # Calculate some helpers
     raster_size = RasterShape(*data[next(iter(metadata))].shape)
@@ -75,7 +76,7 @@ def write_stacked_netcdf(
     # Write the file
     with netCDF4.Dataset(filename, 'w', format='NETCDF4_CLASSIC') as dest:
         # Set top-level file attributes and metadata
-        for key, val in args.metadata.items():
+        for key, val in attributes.items():
             setattr(dest, key, val)
         setattr(dest, "date_created", datetime.datetime.utcnow().isoformat())
 
@@ -117,7 +118,7 @@ def write_stacked_netcdf(
             """Create a data variable, add data, and set attributes."""
             var = dest.createVariable(
                 name, attrs.pop('dtype'), dimensions=("time", "y", "x"),
-                zlib=bool(args.compress_chunk), chunksizes=args.compress_chunk)
+                zlib=bool(chunk_shape), chunksizes=chunk_shape)
             for key, value in attrs.items():
                 setattr(var, key, value)
             var[:] = cube
@@ -126,31 +127,40 @@ def write_stacked_netcdf(
             make_var(dest, name, attrs, data[name])
 
 
-def stack_tiles(fname_list, *, args):
+def stack_tiles(ts_fname_list, *, out_file, attributes, chunk_shape):
     """Stack the list of input tiles, according to the given arguments."""
-    sinusoidal = {}
-    metadata = collections.defaultdict(dict)
-    data = collections.OrderedDict()
-    for timestamp, file in sorted(
-            (fname_metadata(f, args.strptime_fmt).date.timestamp(), f)
-            for f in fname_list):
-        data[timestamp] = data.get(timestamp) or {}
-        get_tile_data(file, metadata, data[timestamp], sinusoidal)
-
-    # check that we did actually read something
-    assert metadata, 'Input files must have data variables'
-    assert sinusoidal, 'MODIS tiles must have a sinusoidal variable'
-
-    out_file = os.path.join(
-        args.output_dir, '{0}.{1.year}.{2}.{3}.{4}'.format(
-            *fname_metadata(os.path.basename(fname_list[0]),
-                            args.strptime_fmt)))
+    assert ts_fname_list, 'List of tiles to stack has contents'
+    data = {}
+    for timestamp, file in sorted(ts_fname_list):
+        # When combining files (eg LFMC + Flammability), unpack and assign
+        # retvals separately... and be careful to validate consistency etc.
+        data[timestamp], metadata, sinusoidal = get_tile_data(file)
+        assert metadata, 'Input files must have data variables'
+        assert sinusoidal, 'MODIS tiles must have a sinusoidal variable'
     # Write out the aggregated thing
     write_stacked_netcdf(
-        filename=out_file, args=args, timestamps=tuple(data),
+        filename=out_file, timestamps=[ts for ts, _ in ts_fname_list],
         data={name: np.stack([dat[name] for dat in data.values()], axis=0)
               for name in metadata},
-        metadata=metadata, sinusoidal=sinusoidal)
+        metadata=metadata, sinusoidal=sinusoidal,
+        attributes=attributes, chunk_shape=chunk_shape)
+
+
+def checkpointer(ts_fname_list, args):
+    """Skip work that has already been done, precalc filenames."""
+    out_file = os.path.join(
+        args.output_dir, '{0}.{1.year}.{2}.{3}.{4}'.format(
+            *fname_metadata(os.path.basename(ts_fname_list[0][1]),
+                            args.strptime_fmt)))
+    if os.path.isfile(out_file):
+        if os.path.getsize(out_file) == 0:
+            # Writing was previously attempted, but wasn't finished
+            os.remove(out_file)
+        elif not args.ignore_checkpoints:
+            return  # A previous job has done this work, and we can skip it
+    # Call the stacker, with just the relevant bits of the args namespace
+    stack_tiles(ts_fname_list, out_file=out_file,
+                attributes=args.metadata, chunk_shape=args.compress_chunk)
 
 
 def main():
@@ -162,10 +172,11 @@ def main():
     grouped_files = collections.defaultdict(list)
     for afile in args.files:
         meta = fname_metadata(afile, args.strptime_fmt)
-        grouped_files[(meta.tile, meta.date.year)].append(afile)
+        grouped_files[(meta.tile, meta.date.year)].append(
+            (meta.date.timestamp(), afile))
 
     # Stack tiles, using multiprocess only if jobs > 1 for nicer tracebacks
-    func = functools.partial(stack_tiles, args=args)
+    func = functools.partial(checkpointer, args=args)
     if args.jobs > 1:
         with concurrent.futures.ProcessPoolExecutor(args.jobs) as executor:
             executor.map(func, grouped_files.values())
@@ -253,6 +264,11 @@ def get_validated_args():
             'default=%(default)s.  The default is tuned for 2D display; '
             'increase time-length of chunk if time-dimension access is '
             'common.  "0" disables compression.'))
+    parser.add_argument(
+        '--ignore_checkpoints', action='store_true',
+        help='Do not skip existing output files - more expensive than '
+        'default behaviour, but allows replacment of "expired" data.  '
+        'Partial files are *not* detected and would otherwise be skipped.')
 
     parser.add_argument(
         '--jobs', default=os.cpu_count() or 1, type=int,
