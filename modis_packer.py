@@ -25,7 +25,7 @@ __version__ = '0.0.2'
 # at the top-left.  See http://www.gdal.org/gdal_datamodel.html
 AffineGeoTransform = collections.namedtuple(
     'GeoTransform', ['origin_x', 'pixel_width', 'x_2',
-                     'origin_y', 'pixel_height', 'y_5'])
+                     'origin_y', 'y_4', 'pixel_height'])
 # An XY coordinate in pixels
 RasterShape = collections.namedtuple('RasterShape', ['time', 'y', 'x'])
 
@@ -63,6 +63,7 @@ def get_tile_data(fname):
             metadata[name] = {k: getattr(attr, k) for k in
                               ('long_name', 'units', 'grid_mapping', 'dtype')}
             data[name] = np.copy(attr)
+            data[name][attr == getattr(attr, '_FillValue', np.nan)] = np.nan
     return data, metadata, sinusoidal
 
 
@@ -148,10 +149,10 @@ def stack_tiles(ts_fname_list, *, out_file, attributes, chunk_shape):
 
 def checkpointer(ts_fname_list, args):
     """Skip work that has already been done, precalc filenames."""
-    out_file = os.path.join(
-        args.output_dir, '{0}.{1.year}.{2}.{3}.{4}'.format(
-            *fname_metadata(os.path.basename(ts_fname_list[0][1]),
-                            args.strptime_fmt)))
+    out_file = os.path.basename(ts_fname_list[0][1])
+    date = fname_metadata(out_file, args.strptime_fmt).date
+    out_file = os.path.join(args.output_dir, out_file.replace(
+        date.strftime(args.strptime_fmt), str(date.year)))
     if os.path.isfile(out_file):
         if os.path.getsize(out_file) == 0:
             # Writing was previously attempted, but wasn't finished
@@ -238,7 +239,7 @@ def get_validated_args():
                 'all dimensions of chunksize must be natural numbers')
         return size
 
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument(
         '-V', '--version', action='version', version=__version__)
 
@@ -246,7 +247,7 @@ def get_validated_args():
         'files', type=glob_arg_type,
         help='glob pattern for the file(s) to process')
     parser.add_argument(
-        '--output_dir', type=dir_arg_type, default='.', metavar='DIR',
+        '--output-dir', type=dir_arg_type, default='.', metavar='DIR',
         help='directory for output files. default="%(default)s"')
 
     parser.add_argument(
@@ -258,14 +259,14 @@ def get_validated_args():
         help='Date format in filenames. default=%(default)s')
 
     parser.add_argument(
-        '--compress_chunk', default=chunksize_type('1,240,240'),
+        '--compress-chunk', default=chunksize_type('1,240,240'),
         metavar='T,Y,X', type=chunksize_type, help=(
             'Chunk size for compression as comma-seperated integers, '
             'default=%(default)s.  The default is tuned for 2D display; '
             'increase time-length of chunk if time-dimension access is '
             'common.  "0" disables compression.'))
     parser.add_argument(
-        '--ignore_checkpoints', action='store_true',
+        '--ignore-checkpoints', action='store_true',
         help='Do not skip existing output files - more expensive than '
         'default behaviour, but allows replacment of "expired" data.  '
         'Partial files are *not* detected and would otherwise be skipped.')
