@@ -9,25 +9,64 @@ datasets (ie variables) from multiple files.
 import argparse
 import collections
 import concurrent.futures
+import contextlib
 import datetime
 import functools
 import glob
 import json
+import logging
 import os
 
 import netCDF4
 import numpy as np
 
 # Version of the generic Modis Tile Stacker
-__version__ = '0.0.2'
+__version__ = '0.1.0'
 
 # Names are descriptive assuming a north-up image, and raster coords start
 # at the top-left.  See http://www.gdal.org/gdal_datamodel.html
 AffineGeoTransform = collections.namedtuple(
     'GeoTransform', ['origin_x', 'pixel_width', 'x_2',
                      'origin_y', 'y_4', 'pixel_height'])
-# An XY coordinate in pixels
+
 RasterShape = collections.namedtuple('RasterShape', ['time', 'y', 'x'])
+
+# Set up some simple logging, for diagnosis of large batch jobs
+logging.basicConfig(
+    level=logging.INFO,
+    style='{',
+    format='{asctime} {levelname:8} {name:12} {message}',
+    datefmt='%Y-%m-%dT%H:%M:%S'
+    )
+log = logging.getLogger(__name__)
+
+
+class PrefixAdapter(logging.LoggerAdapter):
+    def process(self, msg, kwargs):
+        return '{}    {}'.format(self.extra['prefix'], msg), kwargs
+
+
+@contextlib.contextmanager
+def log_prefix(prefix, _stack=[]):
+    """Context manager that pushes prefix in before a log message."""
+    _stack.append(prefix)
+    global log
+    __old_log = log
+    log = PrefixAdapter(
+        logging.getLogger(__name__), {'prefix': ':'.join(_stack)})
+    try:
+        yield
+    finally:
+        _stack.pop()
+        log = __old_log
+
+
+def log_prefix_decorator(func):
+    @functools.wraps(func)
+    @log_prefix('func=' + func.__name__)
+    def wrapper(*args, **kwds):
+        return func(*args, **kwds)  
+    return wrapper
 
 
 def fname_metadata(path, date_fmt=None):
@@ -43,11 +82,13 @@ def fname_metadata(path, date_fmt=None):
     return metadata(**split)
 
 
+@log_prefix_decorator
 def get_tile_data(fname):
     """Return file data and metadata as dictionaries."""
     assert fname.endswith('.nc')
     data, sinusoidal, metadata = {}, {}, {}
     with netCDF4.Dataset(fname, format='NETCDF4') as src:
+        log.debug('Opened {} for reading'.format(fname))
         assert 'time' not in src.dimensions
         for name, attr in src.variables.items():
             # Skip all but the data-carrying variables
@@ -67,11 +108,13 @@ def get_tile_data(fname):
     return data, metadata, sinusoidal
 
 
+@log_prefix_decorator
 def write_stacked_netcdf(*, filename, timestamps, data, metadata, sinusoidal,
                          attributes, chunk_shape):
     """Write a big file."""
     # Calculate some helpers
     raster_size = RasterShape(*data[next(iter(metadata))].shape)
+    log.debug(raster_size)
     geot = AffineGeoTransform(
         *[float(v) for v in sinusoidal['GeoTransform'].split()])
     # Write the file
@@ -148,26 +191,37 @@ def stack_tiles(ts_fname_list, *, out_file, attributes, chunk_shape):
 
 
 def checkpointer(ts_fname_list, args):
-    """Skip work that has already been done, precalc filenames."""
+    """Skip work that has already been done, precalc filenames, etc.
+    This function is submitted to the process pool, so we also set logging 
+    level and prefix to avoid defaults and shared stacks (!).
+    """
     out_file = os.path.basename(ts_fname_list[0][1])
-    date = fname_metadata(out_file, args.strptime_fmt).date
+    meta = fname_metadata(out_file, args.strptime_fmt)
     out_file = os.path.join(args.output_dir, out_file.replace(
-        date.strftime(args.strptime_fmt), str(date.year)))
-    if os.path.isfile(out_file):
-        if os.path.getsize(out_file) == 0:
-            # Writing was previously attempted, but wasn't finished
-            os.remove(out_file)
-        elif not args.ignore_checkpoints:
-            return  # A previous job has done this work, and we can skip it
-    # Call the stacker, with just the relevant bits of the args namespace
-    stack_tiles(ts_fname_list, out_file=out_file,
-                attributes=args.metadata, chunk_shape=args.compress_chunk)
+        meta.date.strftime(args.strptime_fmt), str(meta.date.year)))
+    # Reset log prefix stack, and start fresh with tile and year
+    log.setLevel(args.loglevel)  # also set this for each process...
+    with log_prefix('tile={}:year={}'.format(meta.tile, meta.date.year)):
+        log.info('Output path is ' + out_file)
+        if os.path.isfile(out_file):
+            if os.path.getsize(out_file) == 0:
+                # Writing was previously attempted, but wasn't finished
+                log.debug('Removing empty file, will retry stacking')
+                os.remove(out_file)
+            elif not args.ignore_checkpoints:
+                log.info('File already exists, nothing more to do here.')
+                return
+        # Call the stacker, with just the relevant bits of the args namespace
+        stack_tiles(ts_fname_list, out_file=out_file,
+                    attributes=args.metadata, chunk_shape=args.compress_chunk)
 
 
 def main():
     """Run the embarrassingly parrellel worker function (stack_tiles)."""
     # Get shell arguments, which are pre-validated and transformed (below)
     args = get_validated_args()
+    log.setLevel(args.loglevel)
+    log.debug('Got the args')
 
     # Group input files by tile ID string and year
     grouped_files = collections.defaultdict(list)
@@ -178,10 +232,13 @@ def main():
 
     # Stack tiles, using multiprocess only if jobs > 1 for nicer tracebacks
     func = functools.partial(checkpointer, args=args)
-    if args.jobs > 1:
+    pool_size = min([len(grouped_files), args.jobs])
+    if pool_size > 1:
+        log.info('Using pool of %i processes; errors suppressed', pool_size)
         with concurrent.futures.ProcessPoolExecutor(args.jobs) as executor:
             executor.map(func, grouped_files.values())
     else:
+        log.info('Using serial execution mode')
         list(map(func, grouped_files.values()))
 
 
@@ -274,6 +331,16 @@ def get_validated_args():
     parser.add_argument(
         '--jobs', default=os.cpu_count() or 1, type=int,
         help='How many processes to use.  default: num_CPUs == %(default)s')
+
+    log_grp = parser.add_mutually_exclusive_group()
+    log_grp.add_argument(
+        '--quiet', action="store_const", dest="loglevel", 
+        help='Only log warnings or errors, not informational messages',
+        const=logging.WARNING, default=logging.INFO)
+    log_grp.add_argument(
+        '--verbose', action="store_const", dest="loglevel", 
+        help='Log all messages, including debug information',
+        const=logging.DEBUG)
 
     return parser.parse_args()
 
