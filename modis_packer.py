@@ -274,17 +274,23 @@ def checkpointer(ts_fname_list, args):
     log.setLevel(args.loglevel)  # also set this for each process...
     with log_prefix('tile={}:year={}'.format(meta.tile, meta.date.year)):
         log.info('Output path is ' + out_file)
+        # The lockfile is used to ensure that we notice if a killed
+        # process leaves a partial file, and start over.
+        lockfile = out_file + '.INPROGRESS'
         if os.path.isfile(out_file):
-            if os.path.getsize(out_file) == 0:
+            if os.path.isfile(lockfile) or os.path.getsize(out_file) == 0:
                 # Writing was previously attempted, but wasn't finished
-                log.debug('Removing empty file, will retry stacking')
                 os.remove(out_file)
+                log.info('Removing incomplete version of file')
             elif not args.ignore_checkpoints:
                 log.info('File already exists, nothing more to do here.')
                 return
         # Call the stacker, with just the relevant bits of the args namespace
-        stack_tiles(ts_fname_list, out_file=out_file,
+        with open(lockfile, 'w'):
+            pass
+        stack_tiles(ts_fname_list, out_file=out_file, reproject=args.as_wgs84,
                     attributes=args.metadata, chunk_shape=args.compress_chunk)
+        os.remove(lockfile)
 
 
 def main():
