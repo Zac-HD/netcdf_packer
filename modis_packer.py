@@ -15,6 +15,7 @@ import functools
 import glob
 import json
 import logging
+import math
 import os
 
 import netCDF4
@@ -109,14 +110,62 @@ def get_tile_data(fname):
 
 
 @log_prefix_decorator
+def project_array_to_latlon(array, geot, wkt_str, out_res_degrees=0.005):
+    """Reproject a tile from Modis Sinusoidal to WGS84 Lat/Lon coordinates.
+    Metadata is handled by the calling function.
+    """
+    from osgeo import gdal, gdal_array, osr
+    assert isinstance(geot, AffineGeoTransform)
+
+    def array_to_raster(array, geot, wkt):
+        ysize, xsize = array.shape  # unintuitive order, but correct!
+        dataset = gdal.GetDriverByName('MEM').Create(
+            '', xsize, ysize,
+            eType=gdal_array.NumericTypeCodeToGDALTypeCode(array.dtype))
+        dataset.SetGeoTransform(geot)
+        dataset.SetProjection(wkt)
+        dataset.GetRasterBand(1).WriteArray(array)
+        return dataset
+
+    input_data = array_to_raster(array, geot, wkt_str)
+
+    # Set up the reference systems and transformation
+    from_sr = osr.SpatialReference()
+    from_sr.ImportFromWkt(wkt_str)
+    to_sr = osr.SpatialReference()
+    to_sr.SetWellKnownGeogCS("WGS84")
+    tx = osr.CoordinateTransformation(from_sr, to_sr)
+
+    # Get all corners in new proj, and determine the bounding box
+    lrx = geot.origin_x + geot.pixel_width * input_data.RasterXSize
+    lry = geot.origin_y + geot.pixel_height * input_data.RasterYSize
+    xs, ys, _ = zip(*(tx.TransformPoint(*coord) for coord in [
+        (geot.origin_x, geot.origin_y), (geot.origin_x, lry),
+        (lrx, geot.origin_y), (lrx, lry)]))
+
+    new_geot = AffineGeoTransform(
+        min(xs), out_res_degrees, 0, max(ys), 0, -out_res_degrees)
+    def arr_size(ds):
+        return math.ceil((max(ds) - min(ds)) / out_res_degrees)
+    dest_arr = np.empty((arr_size(ys), arr_size(xs)))
+    dest_arr[:] = np.nan
+    dest = array_to_raster(dest_arr, new_geot, to_sr.ExportToWkt())
+
+    # Perform the projection/resampling
+    gdal.ReprojectImage(
+        input_data, dest,
+        from_sr.ExportToWkt(), to_sr.ExportToWkt(),
+        gdal.GRA_Bilinear)
+    return dest.GetRasterBand(1).ReadAsArray(), new_geot
+
+
+@log_prefix_decorator
 def write_stacked_netcdf(*, filename, timestamps, data, metadata, sinusoidal,
-                         attributes, chunk_shape):
+                         attributes, chunk_shape, geot):
     """Write a big file."""
     # Calculate some helpers
     raster_size = RasterShape(*data[next(iter(metadata))].shape)
     log.debug(raster_size)
-    geot = AffineGeoTransform(
-        *[float(v) for v in sinusoidal['GeoTransform'].split()])
     # Write the file
     with netCDF4.Dataset(filename, 'w', format='NETCDF4_CLASSIC') as dest:
         # Set top-level file attributes and metadata
@@ -153,10 +202,15 @@ def write_stacked_netcdf(*, filename, timestamps, data, metadata, sinusoidal,
             stop=geot.origin_y + geot.pixel_height * raster_size.y,
             num=raster_size.y)
 
-        # The sinusoidal variable is somewhat special; attrs saved above
-        dest.createVariable("sinusoidal", 'S1', ())
-        for name, val in sinusoidal.items():
-            setattr(dest['sinusoidal'], name, val)
+        if sinusoidal is not None:
+            # The sinusoidal variable is somewhat special; attrs saved above
+            # But not used if data is reprojected to WGS84
+            dest.createVariable("sinusoidal", 'S1', ())
+            for name, val in sinusoidal.items():
+                setattr(dest['sinusoidal'], name, val)
+        else:
+            # TODO:  set up correct grid mapping for WGS84
+            pass
 
         def make_var(dest, name, attrs, cube):
             """Create a data variable, add data, and set attributes."""
@@ -171,7 +225,8 @@ def write_stacked_netcdf(*, filename, timestamps, data, metadata, sinusoidal,
             make_var(dest, name, attrs, data[name])
 
 
-def stack_tiles(ts_fname_list, *, out_file, attributes, chunk_shape):
+def stack_tiles(ts_fname_list, *,
+                out_file, attributes, chunk_shape, reproject):
     """Stack the list of input tiles, according to the given arguments."""
     assert ts_fname_list, 'List of tiles to stack has contents'
     data = {}
@@ -181,13 +236,26 @@ def stack_tiles(ts_fname_list, *, out_file, attributes, chunk_shape):
         data[timestamp], metadata, sinusoidal = get_tile_data(file)
         assert metadata, 'Input files must have data variables'
         assert sinusoidal, 'MODIS tiles must have a sinusoidal variable'
+
+    geot = AffineGeoTransform(
+        *[float(v) for v in sinusoidal['GeoTransform'].split()])
+    if reproject:
+        for name in metadata:
+            for timestamp in data:
+                data[timestamp][name], new_geot = project_array_to_latlon(
+                    data[timestamp][name], geot, sinusoidal['spatial_ref'])
+            # TODO: is this correct??  See writer function note and replace it
+            metadata[name].pop('grid_mapping', None)
+        geot = new_geot
+        sinusoidal = None
+
     # Write out the aggregated thing
     write_stacked_netcdf(
         filename=out_file, timestamps=[ts for ts, _ in ts_fname_list],
         data={name: np.stack([dat[name] for dat in data.values()], axis=0)
               for name in metadata},
         metadata=metadata, sinusoidal=sinusoidal,
-        attributes=attributes, chunk_shape=chunk_shape)
+        attributes=attributes, chunk_shape=chunk_shape, geot=geot)
 
 
 def checkpointer(ts_fname_list, args):
@@ -199,6 +267,9 @@ def checkpointer(ts_fname_list, args):
     meta = fname_metadata(out_file, args.strptime_fmt)
     out_file = os.path.join(args.output_dir, out_file.replace(
         meta.date.strftime(args.strptime_fmt), str(meta.date.year)))
+    if args.as_wgs84:
+        out_file = os.path.join(os.path.dirname(out_file),
+                                'WGS84.' + os.path.basename(out_file))
     # Reset log prefix stack, and start fresh with tile and year
     log.setLevel(args.loglevel)  # also set this for each process...
     with log_prefix('tile={}:year={}'.format(meta.tile, meta.date.year)):
@@ -296,7 +367,7 @@ def get_validated_args():
                 'all dimensions of chunksize must be natural numbers')
         return size
 
-    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         '-V', '--version', action='version', version=__version__)
 
@@ -327,6 +398,9 @@ def get_validated_args():
         help='Do not skip existing output files - more expensive than '
         'default behaviour, but allows replacment of "expired" data.  '
         'Partial files are *not* detected and would otherwise be skipped.')
+    parser.add_argument(
+        '--as-wgs84', action='store_true',
+        help='Reproject data to WGS84 lat/lon as well as aggregating.')
 
     parser.add_argument(
         '--jobs', default=os.cpu_count() or 1, type=int,
@@ -342,7 +416,15 @@ def get_validated_args():
         help='Log all messages, including debug information',
         const=logging.DEBUG)
 
-    return parser.parse_args()
+    # Parse args, and check that osgeo (GDAL) is available if reprojecting
+    args = parser.parse_args()
+    if args.as_wgs84:
+        try:
+            import osgeo
+            assert osgeo
+        except ImportError:
+            parser.error('Cannot reproject data without GDAL (osgeo)')
+    return args
 
 
 if __name__ == '__main__':
