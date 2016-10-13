@@ -27,8 +27,8 @@ __version__ = '0.1.0'
 # Names are descriptive assuming a north-up image, and raster coords start
 # at the top-left.  See http://www.gdal.org/gdal_datamodel.html
 AffineGeoTransform = collections.namedtuple(
-    'GeoTransform', ['origin_x', 'pixel_width', 'x_2',
-                     'origin_y', 'y_4', 'pixel_height'])
+    'GeoTransform', ['origin_x', 'pixel_width', 'x_rot',
+                     'origin_y', 'y_rot', 'pixel_height'])
 
 RasterShape = collections.namedtuple('RasterShape', ['time', 'y', 'x'])
 
@@ -66,7 +66,7 @@ def log_prefix_decorator(func):
     @functools.wraps(func)
     @log_prefix('func=' + func.__name__)
     def wrapper(*args, **kwds):
-        return func(*args, **kwds)  
+        return func(*args, **kwds)
     return wrapper
 
 
@@ -260,7 +260,7 @@ def stack_tiles(ts_fname_list, *,
 
 def checkpointer(ts_fname_list, args):
     """Skip work that has already been done, precalc filenames, etc.
-    This function is submitted to the process pool, so we also set logging 
+    This function is submitted to the process pool, so we also set logging
     level and prefix to avoid defaults and shared stacks (!).
     """
     out_file = os.path.basename(ts_fname_list[0][1])
@@ -408,11 +408,11 @@ def get_validated_args():
 
     log_grp = parser.add_mutually_exclusive_group()
     log_grp.add_argument(
-        '--quiet', action="store_const", dest="loglevel", 
+        '--quiet', action="store_const", dest="loglevel",
         help='Only log warnings or errors, not informational messages',
         const=logging.WARNING, default=logging.INFO)
     log_grp.add_argument(
-        '--verbose', action="store_const", dest="loglevel", 
+        '--verbose', action="store_const", dest="loglevel",
         help='Log all messages, including debug information',
         const=logging.DEBUG)
 
