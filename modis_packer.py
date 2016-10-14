@@ -1,8 +1,15 @@
 #!/usr/bin/env python3
 """A tool to pack Modis tiles into NetCDF files, aggregated by tile and year.
 
-Planned features include reprojection (sinusoidal to WGS84) and combining
-datasets (ie variables) from multiple files.
+modis_packer.py has a number of useful features:
+- checkpointing: including detection of unfinished files, so you can process
+  an archive in small chunks
+- optional reprojection to WGS84 lat/lon, which (unlike the MODIS proj) can
+  be reprojected on-the-fly by most data services for eg. web mapping
+- compresses data by default (can be tuned or disabled)
+- multiprocessing detects available CPUs by default, or specify the size
+  of the process pool to use with --jobs
+- extensive logging, with --quiet and --verbose flags available
 
 """
 
@@ -29,7 +36,6 @@ __version__ = '0.1.0'
 AffineGeoTransform = collections.namedtuple(
     'GeoTransform', ['origin_x', 'pixel_width', 'x_rot',
                      'origin_y', 'y_rot', 'pixel_height'])
-
 RasterShape = collections.namedtuple('RasterShape', ['time', 'y', 'x'])
 
 # Set up some simple logging, for diagnosis of large batch jobs
@@ -81,6 +87,17 @@ def fname_metadata(path, date_fmt=None):
     split = dict(zip(parts, fname_parts))
     split['date'] = datetime.datetime.strptime(split['date'], date_fmt)
     return metadata(**split)
+
+
+def get_out_fname(ts_fname_list, args):
+    """Return the path to the aggregated file this input contributes to."""
+    out_file = os.path.basename(ts_fname_list[0][1])
+    meta = fname_metadata(out_file, args.strptime_fmt)
+    prefix = 'WGS84.' if args.as_wgs84 else ''
+    out_file = os.path.join(
+        args.output_dir, prefix + out_file.replace(
+        meta.date.strftime(args.strptime_fmt), str(meta.date.year)))
+    return out_file
 
 
 @log_prefix_decorator
@@ -258,39 +275,29 @@ def stack_tiles(ts_fname_list, *,
         attributes=attributes, chunk_shape=chunk_shape, geot=geot)
 
 
-def checkpointer(ts_fname_list, args):
+def checkpointer(data, args):
     """Skip work that has already been done, precalc filenames, etc.
     This function is submitted to the process pool, so we also set logging
     level and prefix to avoid defaults and shared stacks (!).
     """
-    out_file = os.path.basename(ts_fname_list[0][1])
-    meta = fname_metadata(out_file, args.strptime_fmt)
-    out_file = os.path.join(args.output_dir, out_file.replace(
-        meta.date.strftime(args.strptime_fmt), str(meta.date.year)))
-    if args.as_wgs84:
-        out_file = os.path.join(os.path.dirname(out_file),
-                                'WGS84.' + os.path.basename(out_file))
+    tile, year, outfname, tsfiles = data
     # Reset log prefix stack, and start fresh with tile and year
     log.setLevel(args.loglevel)  # also set this for each process...
-    with log_prefix('tile={}:year={}'.format(meta.tile, meta.date.year)):
-        log.info('Output path is ' + out_file)
+    with log_prefix('tile={}:year={}'.format(tile, year)):
         # The lockfile is used to ensure that we notice if a killed
         # process leaves a partial file, and start over.
-        lockfile = out_file + '.INPROGRESS'
-        if os.path.isfile(out_file):
-            if os.path.isfile(lockfile) or os.path.getsize(out_file) == 0:
-                # Writing was previously attempted, but wasn't finished
-                os.remove(out_file)
-                log.info('Removing incomplete version of file')
-            elif not args.ignore_checkpoints:
-                log.info('File already exists, nothing more to do here.')
-                return
-        # Call the stacker, with just the relevant bits of the args namespace
+        lockfile = outfname + '.INPROGRESS'
         with open(lockfile, 'w'):
             pass
-        stack_tiles(ts_fname_list, out_file=out_file, reproject=args.as_wgs84,
-                    attributes=args.metadata, chunk_shape=args.compress_chunk)
-        os.remove(lockfile)
+        # Call the stacker, with just the relevant bits of the args namespace
+        log.info('Output path is ' + outfname)
+        try:
+            stack_tiles(tsfiles, out_file=outfname,
+                        reproject=args.as_wgs84, attributes=args.metadata,
+                        chunk_shape=args.compress_chunk)
+            os.remove(lockfile)
+        except Exception:
+            log.exception('Something went very wrong!')
 
 
 def main():
@@ -307,16 +314,39 @@ def main():
         grouped_files[(meta.tile, meta.date.year)].append(
             (meta.date.timestamp(), afile))
 
+    # Process data a bit; clear partial files, log work to do up front
+    StackArg = collections.namedtuple('data',
+                                      ['tile', 'year', 'out', 'tsfiles'])
+    grouped_files = [
+        StackArg(tile, year, get_out_fname(ts_files, args), ts_files)
+        for (tile, year), ts_files in grouped_files.items()]
+    log.info('Found {} files over {} groups in total'.format(
+             sum(len(d.tsfiles) for d in grouped_files), len(grouped_files)))
+    for data in grouped_files:
+        if os.path.isfile(data.out) and (
+                os.path.isfile(data.out + '.INPROGRESS') or
+                os.path.getsize(data.out) == 0):
+            os.remove(data.out)
+            log.info('Removing incomplete version of ' + data.out)
+    grouped_files = [data for data in grouped_files if
+                     args.ignore_checkpoints or not os.path.isfile(data.out)]
+    if not grouped_files:
+        log.info('All files have been processed by a previous run.')
+        return
+    log.info('{} files over {} groups have not yet been aggregated'.format(
+         sum(len(d.tsfiles) for d in grouped_files), len(grouped_files)))
+
     # Stack tiles, using multiprocess only if jobs > 1 for nicer tracebacks
-    func = functools.partial(checkpointer, args=args)
+    args_to_map_call = (functools.partial(checkpointer, args=args),
+                        map(tuple, grouped_files))
     pool_size = min([len(grouped_files), args.jobs])
     if pool_size > 1:
         log.info('Using pool of %i processes; errors suppressed', pool_size)
         with concurrent.futures.ProcessPoolExecutor(args.jobs) as executor:
-            executor.map(func, grouped_files.values())
+            executor.map(*args_to_map_call)
     else:
         log.info('Using serial execution mode')
-        list(map(func, grouped_files.values()))
+        list(map(*args_to_map_call))
 
 
 def get_validated_args():
@@ -373,7 +403,11 @@ def get_validated_args():
                 'all dimensions of chunksize must be natural numbers')
         return size
 
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description=__doc__.strip(),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='Contact:  zac.hatfield.dodds@anu.edu.au',
+        )
     parser.add_argument(
         '-V', '--version', action='version', version=__version__)
 
@@ -402,8 +436,7 @@ def get_validated_args():
     parser.add_argument(
         '--ignore-checkpoints', action='store_true',
         help='Do not skip existing output files - more expensive than '
-        'default behaviour, but allows replacment of "expired" data.  '
-        'Partial files are *not* detected and would otherwise be skipped.')
+        'default behaviour, but allows replacment of "expired" data.')
     parser.add_argument(
         '--as-wgs84', action='store_true',
         help='Reproject data to WGS84 lat/lon as well as aggregating.')
