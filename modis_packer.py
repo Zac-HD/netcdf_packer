@@ -29,7 +29,7 @@ import netCDF4
 import numpy as np
 
 # Version of the generic Modis Tile Stacker
-__version__ = '0.1.0'
+__version__ = '0.9.0'
 
 # Names are descriptive assuming a north-up image, and raster coords start
 # at the top-left.  See http://www.gdal.org/gdal_datamodel.html
@@ -199,40 +199,43 @@ def write_stacked_netcdf(*, filename, timestamps, data, metadata, sinusoidal,
         dest['time'].standard_name = "time"
         dest['time'][:] = timestamps
 
-        dest.createDimension("x", raster_size.x)
-        dest.createVariable("x", "f8", ("x",))
-        dest['x'].units = "m"
-        dest['x'].long_name = "x coordinate of projection"
-        dest['x'].standard_name = "projection_x_coordinate"
-        dest['x'][:] = np.linspace(
-            start=geot.origin_x,
-            stop=geot.origin_x + geot.pixel_width * raster_size.x,
-            num=raster_size.x)
+        ydm, xdm = ('y', 'x') if sinusoidal else ('latitude', 'longitude')
 
-        dest.createDimension("y", raster_size.y)
-        dest.createVariable("y", "f8", ("y",))
-        dest['y'].units = "m"
-        dest['y'].long_name = "y coordinate of projection"
-        dest['y'].standard_name = "projection_y_coordinate"
-        dest['y'][:] = np.linspace(
+        dest.createDimension(ydm, raster_size.y)
+        dest.createVariable(ydm, "f8", (ydm,))
+        dest[ydm][:] = np.linspace(
             start=geot.origin_y,
             stop=geot.origin_y + geot.pixel_height * raster_size.y,
             num=raster_size.y)
 
-        if sinusoidal is not None:
+        dest.createDimension(xdm, raster_size.x)
+        dest.createVariable(xdm, "f8", (xdm,))
+        dest[xdm][:] = np.linspace(
+            start=geot.origin_x,
+            stop=geot.origin_x + geot.pixel_width * raster_size.x,
+            num=raster_size.x)
+
+        if sinusoidal:
+            for dim in (xdm, ydm):
+                dest[dim].long_name = dim + " coordinate of projection"
+                dest[dim].standard_name = 'projection_' + dim + '_coordinate'
+                dest[dim].units = 'm'
             # The sinusoidal variable is somewhat special; attrs saved above
             # But not used if data is reprojected to WGS84
             dest.createVariable("sinusoidal", 'S1', ())
             for name, val in sinusoidal.items():
                 setattr(dest['sinusoidal'], name, val)
         else:
-            # TODO:  set up correct grid mapping for WGS84
-            pass
+            for dim, unit in ((xdm, 'degrees_east'), (ydm, 'degrees_north')):
+                dest[dim].standard_name = dest[dim].long_name = dim
+                dest[dim].units = unit
+            for meta in metadata.values():
+                meta.pop('grid_mapping', None)
 
         def make_var(dest, name, attrs, cube):
             """Create a data variable, add data, and set attributes."""
             var = dest.createVariable(
-                name, attrs.pop('dtype'), dimensions=("time", "y", "x"),
+                name, attrs.pop('dtype'), dimensions=('time', ydm, xdm),
                 zlib=bool(chunk_shape), chunksizes=chunk_shape)
             for key, value in attrs.items():
                 setattr(var, key, value)
@@ -248,8 +251,6 @@ def stack_tiles(ts_fname_list, *,
     assert ts_fname_list, 'List of tiles to stack has contents'
     data = {}
     for timestamp, file in sorted(ts_fname_list):
-        # When combining files (eg LFMC + Flammability), unpack and assign
-        # retvals separately... and be careful to validate consistency etc.
         data[timestamp], metadata, sinusoidal = get_tile_data(file)
         assert metadata, 'Input files must have data variables'
         assert sinusoidal, 'MODIS tiles must have a sinusoidal variable'
@@ -261,8 +262,6 @@ def stack_tiles(ts_fname_list, *,
             for timestamp in data:
                 data[timestamp][name], new_geot = project_array_to_latlon(
                     data[timestamp][name], geot, sinusoidal['spatial_ref'])
-            # TODO: is this correct??  See writer function note and replace it
-            metadata[name].pop('grid_mapping', None)
         geot = new_geot
         sinusoidal = None
 
