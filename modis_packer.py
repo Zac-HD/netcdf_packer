@@ -330,7 +330,7 @@ def main():
     grouped_files = [data for data in grouped_files if
                      args.ignore_checkpoints or not os.path.isfile(data.out)]
     if not grouped_files:
-        log.info('All files have been processed by a previous run.')
+        log.info('All files have been processed by a previous run, exiting')
         return
     log.info('{} files over {} groups have not yet been aggregated'.format(
          sum(len(d.tsfiles) for d in grouped_files), len(grouped_files)))
@@ -346,6 +346,7 @@ def main():
     else:
         log.info('Using serial execution mode')
         list(map(*args_to_map_call))
+    log.info('Job finished')
 
 
 def get_validated_args():
