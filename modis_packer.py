@@ -370,18 +370,16 @@ def get_validated_args():
             raise argparse.ArgumentTypeError('path is not a directory')
         return val
 
-    def nc_meta_type(fname):
+    def nc_meta_type(fname, require=True):
         """Load attributes from json file with useful errors."""
-        if not os.path.isfile(fname):
-            raise argparse.ArgumentTypeError(fname + ' does not exist')
         try:
             with open(fname) as file_handle:
-                attrs = json.load(file_handle)
+                return json.load(file_handle)
         except:
-            raise argparse.ArgumentTypeError(
-                'could not load attributes from ' + fname)
-        # TODO:  check attributes match relevant conventions
-        return attrs
+            if require:
+                raise argparse.ArgumentTypeError(
+                    'could not load attributes from ' + fname)
+            return {}
 
     def chunksize_type(string):
         """Validate arg and transform string to 3-tuple representing size."""
@@ -419,7 +417,7 @@ def get_validated_args():
 
     parser.add_argument(
         '--metadata', type=nc_meta_type, metavar='FILE',
-        default=nc_meta_type('./nc_metadata.json'),
+        default=nc_meta_type('./nc_metadata.json', require=False),
         help='path to netCDF attributes file (default ./nc_metadata.json)')
     parser.add_argument(
         '--strptime_fmt', default='A%Y%j', metavar='FMT',
@@ -462,6 +460,8 @@ def get_validated_args():
             assert osgeo
         except ImportError:
             parser.error('Cannot reproject data without GDAL (osgeo)')
+    if not args.metadata:
+        log.warning('No output attributes set - please specify metadata.json')
     return args
 
 
