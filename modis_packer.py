@@ -334,13 +334,15 @@ def main():
         return
     log.info('{} files over {} groups have not yet been aggregated'.format(
          sum(len(d.tsfiles) for d in grouped_files), len(grouped_files)))
+    if args.dryrun:
+        return
 
     # Stack tiles, using multiprocess only if jobs > 1 for nicer tracebacks
     args_to_map_call = (functools.partial(checkpointer, args=args),
                         map(tuple, grouped_files))
     pool_size = min([len(grouped_files), args.jobs])
     if pool_size > 1:
-        log.info('Using pool of %i processes; errors suppressed', pool_size)
+        log.info('Using pool of %i processes', pool_size)
         with concurrent.futures.ProcessPoolExecutor(args.jobs) as executor:
             executor.map(*args_to_map_call)
     else:
@@ -435,6 +437,9 @@ def get_validated_args():
         '--ignore-checkpoints', action='store_true',
         help='Do not skip existing output files - more expensive than '
         'default behaviour, but allows replacment of "expired" data.')
+    parser.add_argument(
+        '--dryrun', action='store_true',
+        help='Print how many files would be processed, then exit.')
     parser.add_argument(
         '--as-wgs84', action='store_true',
         help='Reproject data to WGS84 lat/lon as well as aggregating.')
