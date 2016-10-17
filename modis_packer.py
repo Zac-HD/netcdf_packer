@@ -316,9 +316,10 @@ def main():
     # Process data a bit; clear partial files, log work to do up front
     StackArg = collections.namedtuple('data',
                                       ['tile', 'year', 'out', 'tsfiles'])
-    grouped_files = sorted(
+    grouped_files = sorted((
         StackArg(tile, year, get_out_fname(ts_files, args), ts_files)
-        for (tile, year), ts_files in grouped_files.items())
+        for (tile, year), ts_files in grouped_files.items()),
+        key=lambda sa: sa.year, sa.tile)
     log.info('Found {} files over {} groups in total'.format(
              sum(len(d.tsfiles) for d in grouped_files), len(grouped_files)))
     for data in grouped_files:
