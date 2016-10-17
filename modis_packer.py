@@ -316,9 +316,9 @@ def main():
     # Process data a bit; clear partial files, log work to do up front
     StackArg = collections.namedtuple('data',
                                       ['tile', 'year', 'out', 'tsfiles'])
-    grouped_files = [
+    grouped_files = sorted(
         StackArg(tile, year, get_out_fname(ts_files, args), ts_files)
-        for (tile, year), ts_files in grouped_files.items()]
+        for (tile, year), ts_files in grouped_files.items())
     log.info('Found {} files over {} groups in total'.format(
              sum(len(d.tsfiles) for d in grouped_files), len(grouped_files)))
     for data in grouped_files:
@@ -327,6 +327,8 @@ def main():
                 os.path.getsize(data.out) == 0):
             os.remove(data.out)
             log.info('Removing incomplete version of ' + data.out)
+    for lockf in glob.glob(os.path.join(args.output_dir, '*.INPROGRESS')):
+        os.remove(lockf)
     grouped_files = [data for data in grouped_files if
                      args.ignore_checkpoints or not os.path.isfile(data.out)]
     if not grouped_files:
