@@ -256,18 +256,18 @@ def stack_tiles(ts_fname_list, *,
                 out_file, attributes, chunk_shape, reproject):
     """Stack the list of input tiles, according to the given arguments."""
     assert ts_fname_list, 'List of tiles to stack has contents'
+    timestamps, files = zip(*sorted(ts_fname_list))
     data = {}
-    for _, file in sorted(ts_fname_list):
+    for file in files:
         out, metadata, sinusoidal, geot = get_tile_data(file, reproject)
         assert metadata, 'Input files must have data variables'
         assert sinusoidal, 'MODIS tiles must have a sinusoidal variable'
-        for n, grid in out.items():
+        for name, grid in out.items():
+            cube = data.get(name)
             grid = np.expand_dims(grid[:], axis=0)
-            data[n] = np.concatenate([data[n], grid]) if data.get(n) else grid
-
-    # Write out the aggregated thing
+            data[name] = grid if cube is None else np.concatenate([cube, grid])
     write_stacked_netcdf(
-        filename=out_file, timestamps=[ts for ts, _ in ts_fname_list],
+        filename=out_file, timestamps=timestamps,
         data=data, metadata=metadata, sinusoidal=sinusoidal,
         attributes=attributes, chunk_shape=chunk_shape, geot=geot)
 
