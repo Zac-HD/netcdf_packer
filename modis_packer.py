@@ -261,7 +261,7 @@ def stack_tiles(ts_fname_list, *,
     for file in files:
         out, metadata, sinusoidal, geot = get_tile_data(file, reproject)
         assert metadata, 'Input files must have data variables'
-        assert sinusoidal, 'MODIS tiles must have a sinusoidal variable'
+        assert sinusoidal or reproject, 'MODIS must have a sinusoidal variable'
         for name, grid in out.items():
             cube = data.get(name)
             grid = np.expand_dims(grid[:], axis=0)
