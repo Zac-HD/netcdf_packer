@@ -101,7 +101,7 @@ def get_out_fname(ts_fname_list, args):
 
 
 @log_prefix_decorator
-def get_tile_data(fname):
+def get_tile_data(fname, reproject):
     """Return file data and metadata as dictionaries."""
     assert fname.endswith('.nc')
     data, sinusoidal, metadata = {}, {}, {}
@@ -123,7 +123,14 @@ def get_tile_data(fname):
                               ('long_name', 'units', 'grid_mapping', 'dtype')}
             data[name] = np.copy(attr)
             data[name][attr == getattr(attr, '_FillValue', np.nan)] = np.nan
-    return data, metadata, sinusoidal
+    geot = AffineGeoTransform(
+        *[float(v) for v in sinusoidal['GeoTransform'].split()])
+    if reproject:
+        for name in metadata:
+            data[name], new_geot = project_array_to_latlon(
+                data[name], geot, sinusoidal['spatial_ref'])
+        geot, sinusoidal = new_geot, None
+    return data, metadata, sinusoidal, geot
 
 
 @log_prefix_decorator
@@ -250,27 +257,18 @@ def stack_tiles(ts_fname_list, *,
     """Stack the list of input tiles, according to the given arguments."""
     assert ts_fname_list, 'List of tiles to stack has contents'
     data = {}
-    for timestamp, file in sorted(ts_fname_list):
-        data[timestamp], metadata, sinusoidal = get_tile_data(file)
+    for _, file in sorted(ts_fname_list):
+        out, metadata, sinusoidal, geot = get_tile_data(file, reproject)
         assert metadata, 'Input files must have data variables'
         assert sinusoidal, 'MODIS tiles must have a sinusoidal variable'
-
-    geot = AffineGeoTransform(
-        *[float(v) for v in sinusoidal['GeoTransform'].split()])
-    if reproject:
-        for name in metadata:
-            for timestamp in data:
-                data[timestamp][name], new_geot = project_array_to_latlon(
-                    data[timestamp][name], geot, sinusoidal['spatial_ref'])
-        geot = new_geot
-        sinusoidal = None
+        for n, grid in out.items():
+            grid = np.expand_dims(grid[:], axis=0)
+            data[n] = np.concatenate([data[n], grid]) if data.get(n) else grid
 
     # Write out the aggregated thing
     write_stacked_netcdf(
         filename=out_file, timestamps=[ts for ts, _ in ts_fname_list],
-        data={name: np.stack([dat[name] for dat in data.values()], axis=0)
-              for name in metadata},
-        metadata=metadata, sinusoidal=sinusoidal,
+        data=data, metadata=metadata, sinusoidal=sinusoidal,
         attributes=attributes, chunk_shape=chunk_shape, geot=geot)
 
 
