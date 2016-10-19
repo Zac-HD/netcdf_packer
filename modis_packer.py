@@ -258,14 +258,17 @@ def stack_tiles(ts_fname_list, *,
     assert ts_fname_list, 'List of tiles to stack has contents'
     timestamps, files = zip(*sorted(ts_fname_list))
     data = {}
-    for file in files:
+    for i, file in enumerate(files):
         out, metadata, sinusoidal, geot = get_tile_data(file, reproject)
         assert metadata, 'Input files must have data variables'
         assert sinusoidal or reproject, 'MODIS must have a sinusoidal variable'
         for name, grid in out.items():
-            cube = data.get(name)
-            grid = np.expand_dims(grid[:], axis=0)
-            data[name] = grid if cube is None else np.concatenate([cube, grid])
+            if i == 0:
+                a, b = out[name].shape
+                data[name] = np.empty((len(timestamps), a, b),
+                                      dtype=out[name].dtype)
+                data[name][:] = np.nan
+            data[name][i,:] = grid
     write_stacked_netcdf(
         filename=out_file, timestamps=timestamps,
         data=data, metadata=metadata, sinusoidal=sinusoidal,
