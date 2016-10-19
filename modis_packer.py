@@ -37,6 +37,7 @@ AffineGeoTransform = collections.namedtuple(
     'GeoTransform', ['origin_x', 'pixel_width', 'x_rot',
                      'origin_y', 'y_rot', 'pixel_height'])
 RasterShape = collections.namedtuple('RasterShape', ['time', 'y', 'x'])
+LonLat = collections.namedtuple('LonLat', ['lon', 'lat'])  # X,Y order
 
 # Set up some simple logging, for diagnosis of large batch jobs
 logging.basicConfig(
@@ -133,8 +134,62 @@ def get_tile_data(fname, reproject):
     return data, metadata, sinusoidal, geot
 
 
+def reproj_bounding_box(from_sr, to_sr, old_geot, arr_shape, out_res_degrees=0.005):
+    """Reproject the bounding box as upperleft, lowerright coordinate pairs.
+
+    It turns out this is substantially harder than it sounds.
+    - All corners must be calculated, as reprojection will skew the box.
+      (fortunately convex edges stay within the box of corners...)
+    - Bounding boxes which cross the dateline need very careful handling.
+      Latitude is OK, but Longitude is tricky.
+
+    Returns (new_geot, new_shape) in the transformed coord system.
+    """
+    from osgeo import osr
+    transform = osr.CoordinateTransformation(from_sr, to_sr).TransformPoint
+    inv_transform = osr.CoordinateTransformation(to_sr, from_sr).TransformPoint
+
+    # make a list of corners, and transform them into lat/lon coordinates
+    ysize, xsize = arr_shape  # unintuitive order, but correct!
+    far_x = old_geot.origin_x + old_geot.pixel_width * xsize
+    far_y = old_geot.origin_y + old_geot.pixel_height * ysize
+    corners = [(old_geot.origin_x, old_geot.origin_y),
+               (old_geot.origin_x, far_y),
+               (far_x, old_geot.origin_y),
+               (far_x, far_y)]
+    llcorners = [LonLat(*transform(x, y)[:2]) for x, y in corners]
+
+    # Reprojecting modis tiles should give consistent latitudes, well within
+    # one degree given precision limits
+    lat_min, _lat_small, _lat_big, lat_max = sorted(c.lat for c in llcorners)
+    assert _lat_small - lat_min < 1 and lat_max - _lat_big < 1
+
+    # A 'good' coordinate has x-coord error less than 1Km (no dateline)
+    # and not near the prime meridian (reliable demihemisphere detection)
+    check = [inv_transform(lat, lon)[:2] for lat, lon in llcorners]
+    is_ok = [abs(x1 - x2) < 1000 and abs(ll.lon) > 1
+             for (x1, _), ll, (x2, _) in zip(corners, llcorners, check)]
+    good_coords = [coord for coord, ok in zip(llcorners, is_ok) if ok]
+    log.debug((llcorners, is_ok))
+    assert good_coords, "Every data-containing tile has >= 1 corner with data"
+
+    # Now clip the longitude bounding box to avoid crossing the dateline...
+    lon_bound = -180 if good_coords[0].lon < 0 else 180
+    log.debug(lon_bound)
+    lons = sorted(coord.lon if ok else lon_bound
+                                    for coord, ok in zip(llcorners, is_ok))
+    log.debug(lons)
+    lon_min, _, _, lon_max = lons
+
+    return (AffineGeoTransform(lon_min, out_res_degrees, 0,
+                               lat_max, 0, -out_res_degrees),
+            # Remember, our array dimensions are ordered Y,X == Lat,Lon
+            (math.ceil((lat_max - lat_min) / out_res_degrees),
+             math.ceil((lon_max - lon_min) / out_res_degrees)))
+
+
 @log_prefix_decorator
-def project_array_to_latlon(array, geot, wkt_str, out_res_degrees=0.005):
+def project_array_to_latlon(array, geot, wkt_str):
     """Reproject a tile from Modis Sinusoidal to WGS84 Lat/Lon coordinates.
     Metadata is handled by the calling function.
     """
@@ -158,29 +213,19 @@ def project_array_to_latlon(array, geot, wkt_str, out_res_degrees=0.005):
     from_sr.ImportFromWkt(wkt_str)
     to_sr = osr.SpatialReference()
     to_sr.SetWellKnownGeogCS("WGS84")
-    tx = osr.CoordinateTransformation(from_sr, to_sr)
 
-    # Get all corners in new proj, and determine the bounding box
-    lrx = geot.origin_x + geot.pixel_width * input_data.RasterXSize
-    lry = geot.origin_y + geot.pixel_height * input_data.RasterYSize
-    xs, ys, _ = zip(*(tx.TransformPoint(*coord) for coord in [
-        (geot.origin_x, geot.origin_y), (geot.origin_x, lry),
-        (lrx, geot.origin_y), (lrx, lry)]))
-
-    new_geot = AffineGeoTransform(
-        min(xs), out_res_degrees, 0, max(ys), 0, -out_res_degrees)
-    def arr_size(ds):
-        return math.ceil((max(ds) - min(ds)) / out_res_degrees)
-    dest_arr = np.empty((arr_size(ys), arr_size(xs)))
+    # Get new geotransform and create destination raster
+    ll_geot, new_shape = reproj_bounding_box(from_sr, to_sr, geot, array.shape)
+    dest_arr = np.empty(new_shape)
     dest_arr[:] = np.nan
-    dest = array_to_raster(dest_arr, new_geot, to_sr.ExportToWkt())
+    dest = array_to_raster(dest_arr, ll_geot, to_sr.ExportToWkt())
 
     # Perform the projection/resampling
     gdal.ReprojectImage(
         input_data, dest,
         from_sr.ExportToWkt(), to_sr.ExportToWkt(),
         gdal.GRA_Bilinear)
-    return dest.GetRasterBand(1).ReadAsArray(), new_geot
+    return dest.GetRasterBand(1).ReadAsArray(), ll_geot
 
 
 @log_prefix_decorator
